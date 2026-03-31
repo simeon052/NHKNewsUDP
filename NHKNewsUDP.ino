@@ -45,18 +45,38 @@ const char RSS_HOST[] = "www3.nhk.or.jp";
 const char RSS_PATH[] = "/rss/news/cat0.xml";
 const uint16_t RSS_PORT = 80;
 
-// 取得するニュース件数と取得間隔
+// 取得するニュース件数
 const uint8_t  MAX_NEWS = 10;
-const uint32_t INTERVAL = 3600000UL;  // 1 時間 (ms)
+
+// NTP 同期とスケジューラ設定
+const IPAddress NTP_SERVER_IP(133, 243, 238, 243);  // ntp.nict.jp のAレコードの1つ
+const uint16_t NTP_PORT = 123;
+const uint16_t NTP_LOCAL_PORT = 2390;
+const uint32_t JST_OFFSET_SEC = 9UL * 3600UL;
+const uint32_t NTP_SYNC_INTERVAL = 6UL * 3600000UL;       // 6 時間ごとに再同期
+const uint32_t SCHEDULE_CHECK_INTERVAL = 1000UL;          // 1 秒ごとに時刻判定
 
 // ================================================================
 
 EthernetClient client;
 EthernetUDP    udp;
-uint32_t       lastFetch;
+EthernetUDP    ntpUdp;
+
+uint32_t       currentEpochUtc = 0;   // 最後に同期した UTC epoch
+uint32_t       lastEpochSyncMs = 0;   // currentEpochUtc を記録した millis()
+uint32_t       lastNtpSyncMs   = 0;
+uint32_t       lastCheckMs     = 0;
+bool           timeSynced      = false;
+int32_t        lastTriggeredSlot = -1;
+
+uint32_t       lastDigest = 0;
+uint8_t        lastCount  = 0;
+bool           hasLastDigest = false;
 
 // Mega は SRAM 8KB あるので余裕を持ったバッファサイズにする
 char titleBuf[256];
+char newsBuf[MAX_NEWS][256];
+char buildDateBuf[80];
 
 // ================================================================
 //  setup / loop
@@ -83,6 +103,7 @@ void setup() {
 
   delay(1000);
   udp.begin(UDP_LOCAL_PORT);
+  ntpUdp.begin(NTP_LOCAL_PORT);
 
   Serial.print(F("[NET] Local IP : "));
   Serial.println(Ethernet.localIP());
@@ -90,18 +111,22 @@ void setup() {
   Serial.print(udpTarget);
   Serial.print(F(":"));
   Serial.println(UDP_TARGET_PORT);
+  Serial.println(F("[SCH] Fetch at xx:15 and xx:45 (06:00-24:00 JST)"));
   Serial.println(F("[SYS] Ready."));
 
-  // 起動直後にすぐ取得
-  lastFetch = (uint32_t)(millis() - INTERVAL);
+  syncTimeFromNTP();
 }
 
 void loop() {
   Ethernet.maintain();  // DHCP リース更新
 
-  if (millis() - lastFetch >= INTERVAL) {
-    lastFetch = millis();
-    fetchAndSend();
+  if (!timeSynced || millis() - lastNtpSyncMs >= NTP_SYNC_INTERVAL) {
+    syncTimeFromNTP();
+  }
+
+  if (millis() - lastCheckMs >= SCHEDULE_CHECK_INTERVAL) {
+    lastCheckMs = millis();
+    runScheduledFetch();
   }
 }
 
@@ -109,7 +134,7 @@ void loop() {
 //  HTTP 接続 → RSS 取得 → UDP 送信
 // ================================================================
 
-void fetchAndSend() {
+void fetchAndSend(bool forceSend) {
   Serial.println(F("--------------------"));
   Serial.print(F("[HTTP] Connecting to "));
   Serial.print(RSS_HOST);
@@ -147,11 +172,85 @@ void fetchAndSend() {
   // HTTP ヘッダー末尾 (\r\n\r\n) を読み飛ばす
   skipHttpHeader();
 
-  // RSS XML をパースして UDP 送信
-  parseRSS();
+  // RSS XML をパースして、変更があれば UDP 送信
+  parseRSS(forceSend);
 
   client.stop();
   Serial.println(F("[SYS] Fetch done."));
+}
+
+uint32_t nowJstEpoch() {
+  if (!timeSynced) return 0;
+  return currentEpochUtc + ((millis() - lastEpochSyncMs) / 1000UL) + JST_OFFSET_SEC;
+}
+
+void runScheduledFetch() {
+  if (!timeSynced) return;
+
+  uint32_t now = nowJstEpoch();
+  uint32_t day = now / 86400UL;
+  uint32_t secOfDay = now % 86400UL;
+
+  uint8_t hour = secOfDay / 3600UL;
+  uint8_t minute = (secOfDay % 3600UL) / 60UL;
+  uint8_t second = secOfDay % 60UL;
+
+  if (hour < 6 || hour > 23) return;
+
+  bool scheduledRegular = (minute == 15 || minute == 45);
+  bool scheduledForced  = ((hour == 7 || hour == 19) && minute == 0);
+  if (!(scheduledRegular || scheduledForced)) return;
+  if (second > 20) return;  // 同一スロットでの実行猶予
+
+  int32_t slot = (int32_t)(day * 1440UL + (uint32_t)hour * 60UL + minute);
+  if (slot == lastTriggeredSlot) return;
+
+  lastTriggeredSlot = slot;
+  fetchAndSend(scheduledForced);
+}
+
+bool syncTimeFromNTP() {
+  uint8_t packet[48];
+  memset(packet, 0, sizeof(packet));
+  packet[0] = 0b11100011;
+  packet[1] = 0;
+  packet[2] = 6;
+  packet[3] = 0xEC;
+  packet[12] = 49;
+  packet[13] = 0x4E;
+  packet[14] = 49;
+  packet[15] = 52;
+
+  while (ntpUdp.parsePacket() > 0) {
+    ntpUdp.read(packet, sizeof(packet));
+  }
+
+  ntpUdp.beginPacket(NTP_SERVER_IP, NTP_PORT);
+  ntpUdp.write(packet, sizeof(packet));
+  ntpUdp.endPacket();
+
+  uint32_t start = millis();
+  while (millis() - start < 2000UL) {
+    int size = ntpUdp.parsePacket();
+    if (size >= 48) {
+      ntpUdp.read(packet, sizeof(packet));
+      uint32_t secs1900 = ((uint32_t)packet[40] << 24) |
+                          ((uint32_t)packet[41] << 16) |
+                          ((uint32_t)packet[42] << 8)  |
+                          (uint32_t)packet[43];
+      const uint32_t SEVENTY_YEARS = 2208988800UL;
+      currentEpochUtc = secs1900 - SEVENTY_YEARS;
+      lastEpochSyncMs = millis();
+      lastNtpSyncMs   = millis();
+      timeSynced      = true;
+      Serial.println(F("[NTP] Time synchronized."));
+      return true;
+    }
+    delay(10);
+  }
+
+  Serial.println(F("[NTP] Timeout."));
+  return false;
 }
 
 // ================================================================
@@ -172,31 +271,64 @@ void printStatusLine() {
   }
 }
 
-// \r\n\r\n が来るまで読み飛ばす
+// HTTP ヘッダー終端（空行）まで読み飛ばす
+// サーバー実装差異で CRLF / LF が混在しても本文開始を検出できるようにする。
 void skipHttpHeader() {
-  uint8_t  state = 0;
-  uint32_t t     = millis();
+  bool     sawAnyChar  = false;
+  bool     lineHasChar = false;
+  uint32_t t           = millis();
+
   while (millis() - t < 8000UL) {
     if (client.available()) {
       char c = (char)client.read();
-      if      (state == 0 && c == '\r') state = 1;
-      else if (state == 1 && c == '\n') state = 2;
-      else if (state == 2 && c == '\r') state = 3;
-      else if (state == 3 && c == '\n') return;
-      else state = (c == '\r') ? 1 : 0;
-    } else if (!client.connected()) return;
-    else delay(1);
+
+      if (c == '\r') continue;  // CR は無視し、LF 基準で行終端判定
+
+      if (c == '\n') {
+        if (sawAnyChar && !lineHasChar) {
+          // 直前行が空行 => ヘッダー終端
+          return;
+        }
+        sawAnyChar  = true;
+        lineHasChar = false;
+      } else {
+        lineHasChar = true;
+      }
+    } else if (!client.connected()) {
+      return;
+    } else {
+      delay(1);
+    }
   }
+
+  Serial.println(F("[HTTP] Header skip timeout."));
 }
 
 // ================================================================
 //  RSS XML パーサー（ストリーミング、バッファ不要）
 // ================================================================
 
-void parseRSS() {
-  bool    skipFirst = true;  // 最初の <title> はチャンネル名なので読み飛ばす
-  uint8_t count     = 0;
-  uint32_t deadline = millis() + 60000UL;  // 最大 60 秒待つ
+void parseRSS(bool forceSend) {
+  bool     skipFirst = true;  // 最初の <title> はチャンネル名なので読み飛ばす
+  uint8_t  count     = 0;
+  uint32_t digest    = 2166136261UL;  // FNV-1a 32bit
+  uint32_t deadline  = millis() + 60000UL;  // 最大 60 秒待つ
+
+  buildDateBuf[0] = '\0';
+
+  // channel の更新日時を先に取得（配信時にニュース本文より前に送る）
+  if (findStr("<lastBuildDate>", deadline)) {
+    int dlen = readUntilStr("</lastBuildDate>", buildDateBuf, sizeof(buildDateBuf), deadline);
+    if (dlen > 0) {
+      trimWhitespace(buildDateBuf);
+      for (size_t i = 0; buildDateBuf[i] != '\0'; i++) {
+        digest ^= (uint8_t)buildDateBuf[i];
+        digest *= 16777619UL;
+      }
+      digest ^= 0x0A;
+      digest *= 16777619UL;
+    }
+  }
 
   while (count < MAX_NEWS && millis() < deadline) {
     if (!findStr("<title>", deadline)) break;
@@ -214,15 +346,55 @@ void parseRSS() {
 
     if (titleBuf[0] == '\0') continue;  // 空タイトルはスキップ
 
-    Serial.print(F("[NEWS] "));
-    Serial.print(count + 1);
-    Serial.print(F(": "));
-    Serial.println(titleBuf);
+    strncpy(newsBuf[count], titleBuf, sizeof(newsBuf[count]) - 1);
+    newsBuf[count][sizeof(newsBuf[count]) - 1] = '\0';
 
-    sendUDP(count + 1, titleBuf);
+    // タイトル列から簡易ダイジェストを作る
+    for (size_t i = 0; newsBuf[count][i] != '\0'; i++) {
+      digest ^= (uint8_t)newsBuf[count][i];
+      digest *= 16777619UL;
+    }
+    digest ^= 0x0A;
+    digest *= 16777619UL;
+
     count++;
+  }
+
+  if (count == 0) {
+    Serial.println(F("[RSS] No items parsed."));
+    Serial.println(F("[UDP] Sent 0 news items."));
+    return;
+  }
+
+  if (!forceSend && hasLastDigest && count == lastCount && digest == lastDigest) {
+    Serial.println(F("[RSS] No change. Skip UDP send."));
+    return;
+  }
+
+  if (forceSend) {
+    Serial.println(F("[RSS] Forced schedule. Send even without change."));
+  }
+
+  if (buildDateBuf[0] != '\0') {
+    Serial.print(F("[TIME] "));
+    Serial.println(buildDateBuf);
+    sendMetaUDP("TIME", buildDateBuf);
+    delay(50);
+  }
+
+  for (uint8_t i = 0; i < count; i++) {
+    Serial.print(F("[NEWS] "));
+    Serial.print(i + 1);
+    Serial.print(F(": "));
+    Serial.println(newsBuf[i]);
+
+    sendUDP(i + 1, newsBuf[i]);
     delay(100);  // パケット間に少し間隔を開ける
   }
+
+  lastDigest = digest;
+  lastCount = count;
+  hasLastDigest = true;
 
   Serial.print(F("[UDP] Sent "));
   Serial.print(count);
@@ -257,10 +429,10 @@ bool findStr(const char* str, uint32_t deadline) {
 
 // end 文字列が来るまでの内容を buf に格納する
 // 戻り値: 格納した文字数（タイムアウト/切断時は -1）
-int readUntilStr(const char* end, char* buf, uint8_t bufSize, uint32_t deadline) {
+int readUntilStr(const char* end, char* buf, size_t bufSize, uint32_t deadline) {
   uint8_t elen     = (uint8_t)strlen(end);
   uint8_t matchPos = 0;
-  uint8_t bufPos   = 0;
+  size_t  bufPos   = 0;
   char    partial[16];  // </title> は 8 文字なので余裕あり
 
   while (millis() < deadline) {
@@ -313,7 +485,7 @@ void stripCDATA(char* buf) {
   if (!e) return;
 
   char*   content    = s + 9;  // strlen("<![CDATA[") == 9
-  uint8_t contentLen = (uint8_t)(e - content);
+  size_t contentLen = (size_t)(e - content);
   memmove(buf, content, contentLen);
   buf[contentLen] = '\0';
 }
@@ -345,5 +517,15 @@ void sendUDP(uint8_t index, const char* title) {
   udp.write((const uint8_t*)header, strlen(header));
   udp.write((const uint8_t*)title,  strlen(title));
   udp.write((const uint8_t*)"\n",   1);
+  udp.endPacket();
+}
+
+// フォーマット: "<種別>|<内容>\n"  (UTF-8)
+void sendMetaUDP(const char* kind, const char* value) {
+  udp.beginPacket(udpTarget, UDP_TARGET_PORT);
+  udp.write((const uint8_t*)kind, strlen(kind));
+  udp.write((const uint8_t*)"|", 1);
+  udp.write((const uint8_t*)value, strlen(value));
+  udp.write((const uint8_t*)"\n", 1);
   udp.endPacket();
 }
