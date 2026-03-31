@@ -23,6 +23,7 @@
 #include <SPI.h>
 #include <Ethernet.h>
 #include <EthernetUdp.h>
+#include "mywifi.h"
 
 // ================================================================
 //  ★ 設定エリア ― 環境に合わせて変更してください ★
@@ -35,8 +36,8 @@ byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 // IPAddress localIP(192, 168, 11, 200);
 
 // UDP 送信先
-IPAddress     udpTarget(192, 168, 11, 7);
-const uint16_t UDP_TARGET_PORT = 50050;
+IPAddress     udpTarget;
+const uint16_t UDP_TARGET_PORT = LED_SIGNBOARD_PORT;
 const uint16_t UDP_LOCAL_PORT  = 8888;
 
 // RSS フィード (HTTP のみ対応)
@@ -102,6 +103,7 @@ void setup() {
 #endif
 
   delay(1000);
+  udpTarget.fromString(LED_SIGNBOARD_HOST);
   udp.begin(UDP_LOCAL_PORT);
   ntpUdp.begin(NTP_LOCAL_PORT);
 
